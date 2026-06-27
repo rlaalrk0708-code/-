@@ -1,0 +1,1207 @@
+import React, { useState, useRef } from "react";
+
+// 비밀번호는 앱 상태로 관리 (하단 state 참고)
+const CATEGORIES = ["냉장냉동", "냉장", "용품"];
+const CAT_STYLE = {
+  "냉장냉동": { emoji: "🧊", bg: "#EFF6FF", border: "#BFDBFE", text: "#1D4ED8", dot: "#3B82F6" },
+  "냉장":     { emoji: "❄️",  bg: "#F0F9FF", border: "#BAE6FD", text: "#0369A1", dot: "#0EA5E9" },
+  "용품":     { emoji: "🛒", bg: "#F5F3FF", border: "#DDD6FE", text: "#7C3AED", dot: "#8B5CF6" },
+};
+const STATUS_STYLE = {
+  "부족":   { bg: "#FEE2E2", text: "#DC2626", dot: "#EF4444" },
+  "주의":   { bg: "#FEF9C3", text: "#D97706", dot: "#F59E0B" },
+  "충분":   { bg: "#DCFCE7", text: "#15803D", dot: "#22C55E" },
+  "미입력": { bg: "#F1F5F9", text: "#94A3B8", dot: "#CBD5E1" },
+};
+
+async function parseReceipt(base64, mediaType) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-6", max_tokens: 1000,
+      messages: [{ role: "user", content: [
+        { type: "image", source: { type: "base64", media_type: mediaType, data: base64 } },
+        { type: "text", text: `이 영수증/납품서에서 입고 품목과 수량을 추출해주세요.
+카테고리 기준:
+냉장냉동: 냉동반죽, 아이스크림, 냉동 완제품 등 냉동(-18도) 보관 식재료
+냉장: 우유, 크림, 버터, 달걀, 생크림 등 냉장(0~10도) 보관 식재료
+용품: 박스, 봉투, 냅킨, 장갑, 빨대, 세제 등 소모품
+JSON만 반환(다른 텍스트 금지):
+{"items":[{"name":"품목명","qty":수량,"unit":"단위","category":"냉장냉동 또는 냉장 또는 용품"}]}
+단위는 개/kg/L/묶음/박스/팩 중 적절한 것. 수량 불명확시 1.` }
+      ]}]
+    })
+  });
+  const data = await res.json();
+  const raw = data.content?.map(c => c.text || "").join("") || "";
+  return JSON.parse(raw.replace(/```json|```/g, "").trim());
+}
+
+function CategoryBadge({ category }) {
+  const cat = CAT_STYLE[category] || CAT_STYLE["용품"];
+  return (
+    <span style={{ fontSize: 10, fontWeight: 700, background: cat.bg, color: cat.text, borderRadius: 6, padding: "2px 6px", marginRight: 5 }}>
+      {cat.emoji} {category}
+    </span>
+  );
+}
+
+export default function App() {
+  // ── 매장 설정 (최초 1회) ─────────────────────────────────
+  const [storeConfig, setStoreConfig] = useState(null); // { storeName, staffPw, adminPw }
+  const [configStep, setConfigStep]   = useState("storeName"); // storeName | staffPw | adminPw
+  const [configStore, setConfigStore] = useState("");
+  const [configStaffPw, setConfigStaffPw] = useState("");
+  const [configAdminPw, setConfigAdminPw] = useState("");
+  const [configAdminPw2, setConfigAdminPw2] = useState("");
+  const [configError, setConfigError] = useState("");
+
+  // ── 로그인 ──────────────────────────────────────────────
+  const [user, setUser]           = useState(null);
+  const [loginStep, setLoginStep] = useState("name"); // name | staffPw | adminPw
+  const [nameInput, setNameInput] = useState("");
+  const [pwInput, setPwInput]     = useState("");
+  const [pwError, setPwError]     = useState(false);
+  const [page, setPage]               = useState("dashboard");
+  const [items, setItems]             = useState([]);
+  const [inboundLogs, setInboundLogs] = useState([]);
+  const [orderSheets, setOrderSheets] = useState([]);   // 발주서 기록
+
+  // 발주서 화면
+  const [showOrder, setShowOrder]     = useState(false);
+  const [orderItems, setOrderItems]   = useState([]);   // 수정 가능한 발주 수량
+
+  // 스캔
+  const [scanStep, setScanStep]   = useState("idle");
+  const [parsed, setParsed]       = useState([]);
+  const [preview, setPreview]     = useState(null);
+  const [scanError, setScanError] = useState(null);
+  const fileRef = useRef();
+
+  // 품목 추가 폼
+  const [showAddItem, setShowAddItem]   = useState(false);
+  const [newItem, setNewItem]           = useState({ name: "", category: "냉장냉동", unit: "개", weeklyNeeded: "" });
+  const [addItemError, setAddItemError] = useState("");
+
+  const [dashCat, setDashCat]   = useState("전체");
+  const [stockCat, setStockCat] = useState("전체");
+  const [adminTab, setAdminTab] = useState("items");
+
+  // ── 초기 재고 세팅 ────────────────────────────────────────
+  const [setupDone, setSetupDone] = useState(false);
+  const emptyRow = () => ({ id: Date.now() + Math.random(), name: "", category: "냉장냉동", unit: "개", stock: "", weeklyNeeded: "" });
+  const [setupRows, setSetupRows] = useState(() => [emptyRow(), emptyRow(), emptyRow()]);
+  const updateSetupRow = (id, field, val) => setSetupRows(prev => prev.map(r => r.id === id ? { ...r, [field]: val } : r));
+  const addSetupRow = () => setSetupRows(prev => [...prev, { id: Date.now() + Math.random(), name: "", category: "냉장냉동", unit: "개", stock: "", weeklyNeeded: "" }]);
+  const removeSetupRow = (id) => setSetupRows(prev => prev.length > 1 ? prev.filter(r => r.id !== id) : prev);
+  const handleSetupComplete = () => {
+    const valid = setupRows.filter(r => r.name.trim());
+    if (valid.length > 0) {
+      setItems(valid.map(r => ({
+        id: Date.now() + Math.random(),
+        name: r.name.trim(), category: r.category,
+        unit: r.unit || "개",
+        stock: r.stock,
+        weeklyNeeded: r.weeklyNeeded ? parseFloat(r.weeklyNeeded) : null,
+        addedBy: "초기세팅",
+        addedAt: new Date().toLocaleDateString("ko-KR", { month: "short", day: "numeric" }),
+      })));
+    }
+    setSetupDone(true);
+  };
+
+  // ── 헬퍼 ─────────────────────────────────────────────────
+  const getStatus = (item) => {
+    const v = parseFloat(item.stock);
+    if (item.stock === "" || item.stock === undefined || item.stock === null || isNaN(v)) return "미입력";
+    if (!item.weeklyNeeded) return "미입력";
+    const r = v / item.weeklyNeeded;
+    if (r < 0.3) return "부족";
+    if (r < 0.6) return "주의";
+    return "충분";
+  };
+
+  const needQty = (item) => {
+    const cur = parseFloat(item.stock) || 0;
+    const goal = item.weeklyNeeded || 0;
+    return Math.max(0, goal - cur);
+  };
+
+  const visible    = (cat) => cat === "전체" ? items : items.filter(i => i.category === cat);
+  const lowItems   = items.filter(i => getStatus(i) === "부족");
+  const warnItems  = items.filter(i => getStatus(i) === "주의");
+  const filledCnt  = items.filter(i => getStatus(i) !== "미입력").length;
+  const orderNeeds = items.filter(i => (getStatus(i) === "부족" || getStatus(i) === "주의") && needQty(i) > 0);
+
+  // ── 발주서 열기 ───────────────────────────────────────────
+  const openOrderSheet = () => {
+    setOrderItems(orderNeeds.map(i => ({ ...i, orderQty: String(needQty(i)) })));
+    setShowOrder(true);
+  };
+
+  const confirmOrder = () => {
+    const kept = orderItems.filter(i => parseFloat(i.orderQty) > 0);
+    if (!kept.length) return;
+    const sheet = {
+      id: Date.now(),
+      user: user.name,
+      date: new Date().toLocaleDateString("ko-KR", { month: "short", day: "numeric" }),
+      time: new Date().toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" }),
+      items: kept.map(i => ({ name: i.name, category: i.category, unit: i.unit, qty: i.orderQty })),
+      status: "대기",
+    };
+    setOrderSheets(prev => [sheet, ...prev]);
+    setShowOrder(false);
+    setPage("dashboard");
+  };
+
+  // ── 로그인 핸들러 ─────────────────────────────────────────
+  const handleNameSubmit = () => {
+    const name = nameInput.trim(); if (!name) return;
+    if (name === "사장님") { setLoginStep("adminPw"); setPwInput(""); setPwError(false); return; }
+    setLoginStep("staffPw"); setPwInput(""); setPwError(false);
+  };
+  const handleStaffLogin = () => {
+    if (pwInput === storeConfig?.staffPw) { setUser({ name: nameInput.trim(), isAdmin: false }); setPwError(false); }
+    else setPwError(true);
+  };
+  const handleAdminLogin = () => {
+    if (pwInput === storeConfig?.adminPw) { setUser({ name: "사장님", isAdmin: true }); setPwError(false); }
+    else setPwError(true);
+  };
+
+  // ── 품목 추가 ─────────────────────────────────────────────
+  const handleAddItem = () => {
+    if (!newItem.name.trim()) { setAddItemError("품목명을 입력해주세요"); return; }
+    if (items.some(i => i.name === newItem.name.trim())) { setAddItemError("이미 있는 품목이에요"); return; }
+    setItems(prev => [...prev, {
+      id: Date.now(), name: newItem.name.trim(), category: newItem.category,
+      unit: newItem.unit, weeklyNeeded: newItem.weeklyNeeded ? parseFloat(newItem.weeklyNeeded) : null,
+      stock: "", addedBy: user.name,
+      addedAt: new Date().toLocaleDateString("ko-KR", { month: "short", day: "numeric" }),
+    }]);
+    setNewItem({ name: "", category: "냉장냉동", unit: "개", weeklyNeeded: "" });
+    setAddItemError(""); setShowAddItem(false);
+  };
+
+  // ── 영수증 ────────────────────────────────────────────────
+  const handleFile = async (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    setScanError(null); setScanStep("loading"); setParsed([]);
+    setPreview(URL.createObjectURL(file));
+    const reader = new FileReader();
+    reader.onload = async (ev) => {
+      try {
+        const b64 = ev.target.result.split(",")[1];
+        const result = await parseReceipt(b64, file.type || "image/jpeg");
+        setParsed((result.items || []).map((it, i) => ({
+          tempId: Date.now() + i, name: it.name || "", qty: String(it.qty ?? 1),
+          unit: it.unit || "개", category: CATEGORIES.includes(it.category) ? it.category : "용품",
+          weeklyNeeded: "", keep: true, isNew: !items.some(m => m.name === it.name),
+        })));
+        setScanStep("review");
+      } catch {
+        setScanError("영수증을 읽지 못했어요. 더 선명한 사진으로 다시 시도해주세요.");
+        setScanStep("idle");
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const updateParsed = (id, f, v) => setParsed(prev => prev.map(p => p.tempId === id ? { ...p, [f]: v } : p));
+
+  const confirmInbound = () => {
+    const kept = parsed.filter(p => p.keep); if (!kept.length) return;
+    setItems(prev => {
+      let next = [...prev];
+      kept.forEach(p => {
+        const idx = next.findIndex(m => m.name === p.name);
+        if (idx >= 0) {
+          next[idx] = { ...next[idx], stock: String((parseFloat(next[idx].stock) || 0) + parseFloat(p.qty || 0)) };
+        } else {
+          next.push({ id: Date.now() + Math.random(), name: p.name, category: p.category, unit: p.unit, weeklyNeeded: p.weeklyNeeded ? parseFloat(p.weeklyNeeded) : null, stock: p.qty, addedBy: user.name, addedAt: new Date().toLocaleDateString("ko-KR", { month: "short", day: "numeric" }) });
+        }
+      });
+      return next;
+    });
+    setInboundLogs(prev => [{ id: Date.now(), user: user.name, time: new Date().toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" }), date: new Date().toLocaleDateString("ko-KR", { month: "short", day: "numeric" }), items: kept, preview }, ...prev]);
+    setScanStep("done");
+  };
+
+  const resetScan = () => { setScanStep("idle"); setParsed([]); setPreview(null); setScanError(null); if (fileRef.current) fileRef.current.value = ""; };
+
+  const S = {
+    card: { background: "white", borderRadius: 16, padding: "14px 16px", boxShadow: "0 2px 10px rgba(0,0,0,0.06)" },
+    input: { width: "100%", padding: "11px 14px", borderRadius: 10, border: "2px solid #E2E8F0", fontSize: 15, color: "#1E293B", outline: "none", background: "white", boxSizing: "border-box" },
+    btnPrimary: { padding: "13px 20px", borderRadius: 12, border: "none", background: "linear-gradient(135deg,#FF6B35,#C0392B)", color: "white", fontSize: 14, fontWeight: 800, cursor: "pointer", boxShadow: "0 4px 16px rgba(192,57,43,0.3)" },
+    btnSecondary: { padding: "13px 20px", borderRadius: 12, border: "2px solid #E2E8F0", background: "white", color: "#64748B", fontSize: 14, fontWeight: 700, cursor: "pointer" },
+  };
+
+  // ════════════════════════════════════════════════════════
+  // 매장 최초 설정 (storeConfig 없을 때)
+  // ════════════════════════════════════════════════════════
+  if (!storeConfig) return (
+    <div style={{ minHeight: "100vh", background: "linear-gradient(160deg,#FF6B35 0%,#C0392B 100%)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", fontFamily: "-apple-system,'Apple SD Gothic Neo',sans-serif", padding: 24 }}>
+      <div style={{ fontSize: 52, marginBottom: 6 }}>🍩</div>
+      <div style={{ color: "white", fontSize: 22, fontWeight: 800, marginBottom: 4 }}>재고관리 앱 설정</div>
+      <div style={{ color: "rgba(255,255,255,0.75)", fontSize: 13, marginBottom: 28, textAlign: "center" }}>사장님이 처음 한 번만 설정하면<br />직원들이 함께 사용할 수 있어요</div>
+
+      <div style={{ background: "white", borderRadius: 20, padding: "26px 22px", width: "100%", maxWidth: 360, boxShadow: "0 20px 60px rgba(0,0,0,0.25)" }}>
+        {/* 진행 단계 표시 */}
+        <div style={{ display: "flex", gap: 6, marginBottom: 22 }}>
+          {["매장 이름", "직원 비밀번호", "관리자 비밀번호"].map((label, i) => {
+            const stepIdx = configStep === "storeName" ? 0 : configStep === "staffPw" ? 1 : 2;
+            return (
+              <div key={i} style={{ flex: 1, textAlign: "center" }}>
+                <div style={{ width: "100%", height: 4, borderRadius: 99, background: i <= stepIdx ? "#FF6B35" : "#F1F5F9", marginBottom: 5 }} />
+                <div style={{ fontSize: 9, fontWeight: 700, color: i <= stepIdx ? "#FF6B35" : "#CBD5E1" }}>{label}</div>
+              </div>
+            );
+          })}
+        </div>
+
+        {configStep === "storeName" && (
+          <>
+            <div style={{ fontSize: 15, fontWeight: 800, color: "#1E293B", marginBottom: 4 }}>매장 이름을 입력해주세요</div>
+            <div style={{ fontSize: 12, color: "#94A3B8", marginBottom: 16 }}>앱 상단에 표시될 매장 이름이에요</div>
+            <input value={configStore} onChange={e => { setConfigStore(e.target.value); setConfigError(""); }}
+              onKeyDown={e => e.key === "Enter" && configStore.trim() && setConfigStep("staffPw")}
+              placeholder="예) 던킨 홍대점, 던킨 강남점..." style={{ ...S.input, marginBottom: 8 }} autoFocus />
+            {configError && <div style={{ color: "#EF4444", fontSize: 12, marginBottom: 8 }}>⚠️ {configError}</div>}
+            <button onClick={() => { if (!configStore.trim()) { setConfigError("매장 이름을 입력해주세요"); return; } setConfigStep("staffPw"); setConfigError(""); }}
+              style={{ ...S.btnPrimary, width: "100%" }}>다음 →</button>
+          </>
+        )}
+
+        {configStep === "staffPw" && (
+          <>
+            <button onClick={() => setConfigStep("storeName")} style={{ background: "none", border: "none", color: "#94A3B8", fontSize: 13, cursor: "pointer", marginBottom: 12, padding: 0 }}>← 뒤로</button>
+            <div style={{ fontSize: 15, fontWeight: 800, color: "#1E293B", marginBottom: 4 }}>직원 공용 비밀번호 설정</div>
+            <div style={{ fontSize: 12, color: "#94A3B8", marginBottom: 16 }}>모든 직원이 이 비밀번호로 로그인해요</div>
+            <input type="password" value={configStaffPw} onChange={e => { setConfigStaffPw(e.target.value); setConfigError(""); }}
+              onKeyDown={e => e.key === "Enter" && configStaffPw && setConfigStep("adminPw")}
+              placeholder="직원 공용 비밀번호" style={{ ...S.input, marginBottom: 8 }} autoFocus />
+            {configError && <div style={{ color: "#EF4444", fontSize: 12, marginBottom: 8 }}>⚠️ {configError}</div>}
+            <button onClick={() => { if (!configStaffPw) { setConfigError("비밀번호를 입력해주세요"); return; } setConfigStep("adminPw"); setConfigError(""); }}
+              style={{ ...S.btnPrimary, width: "100%" }}>다음 →</button>
+          </>
+        )}
+
+        {configStep === "adminPw" && (
+          <>
+            <button onClick={() => setConfigStep("staffPw")} style={{ background: "none", border: "none", color: "#94A3B8", fontSize: 13, cursor: "pointer", marginBottom: 12, padding: 0 }}>← 뒤로</button>
+            <div style={{ fontSize: 15, fontWeight: 800, color: "#1E293B", marginBottom: 4 }}>👑 관리자(사장님) 비밀번호</div>
+            <div style={{ fontSize: 12, color: "#94A3B8", marginBottom: 16 }}>직원 비밀번호와 다르게 설정하세요</div>
+            <input type="password" value={configAdminPw} onChange={e => { setConfigAdminPw(e.target.value); setConfigError(""); }}
+              placeholder="관리자 비밀번호" style={{ ...S.input, marginBottom: 8 }} autoFocus />
+            <input type="password" value={configAdminPw2} onChange={e => { setConfigAdminPw2(e.target.value); setConfigError(""); }}
+              placeholder="관리자 비밀번호 확인" style={{ ...S.input, marginBottom: 8 }} />
+            {configError && <div style={{ color: "#EF4444", fontSize: 12, marginBottom: 8 }}>⚠️ {configError}</div>}
+            <button onClick={() => {
+              if (!configAdminPw) { setConfigError("관리자 비밀번호를 입력해주세요"); return; }
+              if (configAdminPw !== configAdminPw2) { setConfigError("비밀번호가 일치하지 않아요"); return; }
+              if (configAdminPw === configStaffPw) { setConfigError("직원 비밀번호와 달라야 해요"); return; }
+              setStoreConfig({ storeName: configStore.trim(), staffPw: configStaffPw, adminPw: configAdminPw });
+              setConfigError("");
+            }} style={{ ...S.btnPrimary, width: "100%", background: "linear-gradient(135deg,#7C3AED,#4C1D95)", boxShadow: "0 4px 16px rgba(124,58,237,0.4)" }}>
+              ✅ 설정 완료
+            </button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+
+  // ════════════════════════════════════════════════════════
+  // 로그인
+  // ════════════════════════════════════════════════════════
+  if (!user) return (
+    <div style={{ minHeight: "100vh", background: "linear-gradient(160deg,#FF6B35 0%,#C0392B 100%)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", fontFamily: "-apple-system,'Apple SD Gothic Neo',sans-serif", padding: 24 }}>
+      <div style={{ fontSize: 52, marginBottom: 6 }}>🍩</div>
+      <div style={{ color: "white", fontSize: 20, fontWeight: 800, marginBottom: 2 }}>{storeConfig.storeName}</div>
+      <div style={{ color: "rgba(255,255,255,0.7)", fontSize: 13, marginBottom: 28 }}>재고관리 시스템</div>
+      <div style={{ background: "white", borderRadius: 20, padding: "26px 22px", width: "100%", maxWidth: 360, boxShadow: "0 20px 60px rgba(0,0,0,0.25)" }}>
+        {loginStep === "name" && (
+          <>
+            <div style={{ fontSize: 15, fontWeight: 800, color: "#1E293B", marginBottom: 4 }}>안녕하세요! 👋</div>
+            <div style={{ fontSize: 12, color: "#94A3B8", marginBottom: 16 }}>이름을 입력하고 비밀번호로 로그인해요<br /><span style={{ color: "#FF6B35", fontWeight: 600 }}>사장님</span>이라고 입력하면 관리자로 로그인해요</div>
+            <input value={nameInput} onChange={e => setNameInput(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && nameInput.trim() && handleNameSubmit()}
+              placeholder="이름 입력 (예: 민지, 태양...)" style={{ ...S.input, marginBottom: 12 }} autoFocus />
+            <button onClick={() => { if (nameInput.trim()) handleNameSubmit(); }}
+              style={{ ...S.btnPrimary, width: "100%" }}>다음 →</button>
+          </>
+        )}
+
+        {loginStep === "staffPw" && (
+          <>
+            <button onClick={() => { setLoginStep("name"); setPwInput(""); setPwError(false); }} style={{ background: "none", border: "none", color: "#94A3B8", fontSize: 13, cursor: "pointer", marginBottom: 12, padding: 0 }}>← 뒤로</button>
+            <div style={{ fontSize: 15, fontWeight: 800, color: "#1E293B", marginBottom: 2 }}>반가워요, {nameInput} 님! 👤</div>
+            <div style={{ fontSize: 12, color: "#94A3B8", marginBottom: 16 }}>직원 공용 비밀번호를 입력해주세요</div>
+            <input type="password" value={pwInput} onChange={e => { setPwInput(e.target.value); setPwError(false); }}
+              onKeyDown={e => e.key === "Enter" && handleStaffLogin()}
+              placeholder="직원 비밀번호" style={{ ...S.input, marginBottom: 8, border: `2px solid ${pwError ? "#EF4444" : "#E2E8F0"}` }} autoFocus />
+            {pwError && <div style={{ color: "#EF4444", fontSize: 12, marginBottom: 8 }}>⚠️ 비밀번호가 틀렸어요</div>}
+            <button onClick={handleStaffLogin} style={{ ...S.btnPrimary, width: "100%" }}>로그인</button>
+          </>
+        )}
+
+        {loginStep === "adminPw" && (
+          <>
+            <button onClick={() => { setLoginStep("name"); setPwInput(""); setPwError(false); }} style={{ background: "none", border: "none", color: "#94A3B8", fontSize: 13, cursor: "pointer", marginBottom: 12, padding: 0 }}>← 뒤로</button>
+            <div style={{ fontSize: 15, fontWeight: 800, color: "#1E293B", marginBottom: 2 }}>👑 사장님 로그인</div>
+            <div style={{ fontSize: 12, color: "#94A3B8", marginBottom: 16 }}>관리자 비밀번호를 입력해주세요</div>
+            <input type="password" value={pwInput} onChange={e => { setPwInput(e.target.value); setPwError(false); }}
+              onKeyDown={e => e.key === "Enter" && handleAdminLogin()}
+              placeholder="관리자 비밀번호" style={{ ...S.input, marginBottom: 8, border: `2px solid ${pwError ? "#EF4444" : "#E2E8F0"}` }} autoFocus />
+            {pwError && <div style={{ color: "#EF4444", fontSize: 12, marginBottom: 8 }}>⚠️ 비밀번호가 틀렸어요</div>}
+            <button onClick={handleAdminLogin} style={{ ...S.btnPrimary, width: "100%", background: "linear-gradient(135deg,#7C3AED,#4C1D95)", boxShadow: "0 4px 16px rgba(124,58,237,0.4)" }}>관리자로 로그인</button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+
+  // ════════════════════════════════════════════════════════
+  // 초기 재고 세팅 화면 (최초 1회)
+  // ════════════════════════════════════════════════════════
+  if (!setupDone) return (
+    <div style={{ minHeight: "100vh", background: "linear-gradient(160deg,#FF6B35 0%,#C0392B 100%)", fontFamily: "-apple-system,'Apple SD Gothic Neo',sans-serif" }}>
+      {/* 헤더 */}
+      <div style={{ padding: "24px 20px 20px" }}>
+        <div style={{ color: "rgba(255,255,255,0.8)", fontSize: 13, marginBottom: 4 }}>🍩 던킨도너츠 재고관리</div>
+        <div style={{ color: "white", fontSize: 22, fontWeight: 800 }}>처음 오셨군요! 👋</div>
+        <div style={{ color: "rgba(255,255,255,0.8)", fontSize: 13, marginTop: 6, lineHeight: 1.6 }}>
+          지금 있는 재고를 한번에 등록해두면<br />바로 재고 현황을 확인할 수 있어요
+        </div>
+      </div>
+
+      <div style={{ background: "#F8FAFC", borderRadius: "20px 20px 0 0", minHeight: "calc(100vh - 140px)", padding: "24px 16px 100px" }}>
+
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+          <div style={{ fontSize: 14, fontWeight: 700, color: "#334155" }}>현재 재고 품목 입력</div>
+          <div style={{ fontSize: 12, color: "#94A3B8" }}>{setupRows.filter(r => r.name.trim()).length}개 입력됨</div>
+        </div>
+
+        {/* 컬럼 라벨 */}
+        <div style={{ display: "grid", gridTemplateColumns: "2fr 1.2fr 0.8fr 0.8fr 32px", gap: 6, padding: "0 2px", marginBottom: 6 }}>
+          {["품목명", "카테고리", "수량", "주간목표", ""].map((l, i) => (
+            <div key={i} style={{ fontSize: 10, fontWeight: 700, color: "#94A3B8", textAlign: i >= 2 ? "center" : "left" }}>{l}</div>
+          ))}
+        </div>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 16 }}>
+          {setupRows.map((row, idx) => (
+            <div key={row.id} style={{ display: "grid", gridTemplateColumns: "2fr 1.2fr 0.8fr 0.8fr 32px", gap: 6, alignItems: "center" }}>
+              {/* 품목명 */}
+              <input
+                value={row.name}
+                onChange={e => updateSetupRow(row.id, "name", e.target.value)}
+                placeholder={`품목 ${idx + 1}`}
+                style={{ padding: "10px 10px", borderRadius: 10, border: "2px solid #E2E8F0", fontSize: 13, fontWeight: 600, color: "#1E293B", outline: "none", width: "100%", boxSizing: "border-box" }}
+              />
+              {/* 카테고리 토글 */}
+              <button
+                onClick={() => {
+                  const cycle = ["냉장냉동","냉장","용품"];
+                  const next = cycle[(cycle.indexOf(row.category) + 1) % cycle.length];
+                  updateSetupRow(row.id, "category", next);
+                }}
+                style={{
+                  padding: "10px 6px", borderRadius: 10, border: "none", cursor: "pointer", fontSize: 11, fontWeight: 700,
+                  background: row.category === "냉장냉동" ? "#EFF6FF" : row.category === "냉장" ? "#F0F9FF" : "#F5F3FF",
+                  color: row.category === "냉장냉동" ? "#1D4ED8" : row.category === "냉장" ? "#0369A1" : "#7C3AED",
+                }}
+              >
+                {row.category === "냉장냉동" ? "🧊 냉동" : row.category === "냉장" ? "❄️ 냉장" : "🛒 용품"}
+              </button>
+              {/* 현재 수량 */}
+              <input
+                type="number"
+                value={row.stock}
+                onChange={e => updateSetupRow(row.id, "stock", e.target.value)}
+                placeholder="0"
+                style={{ padding: "10px 6px", borderRadius: 10, border: "2px solid #E2E8F0", fontSize: 13, fontWeight: 700, color: "#FF6B35", textAlign: "center", outline: "none", width: "100%", boxSizing: "border-box" }}
+              />
+              {/* 주간 목표 */}
+              <input
+                type="number"
+                value={row.weeklyNeeded}
+                onChange={e => updateSetupRow(row.id, "weeklyNeeded", e.target.value)}
+                placeholder="목표"
+                style={{ padding: "10px 6px", borderRadius: 10, border: "2px solid #E2E8F0", fontSize: 13, color: "#64748B", textAlign: "center", outline: "none", width: "100%", boxSizing: "border-box" }}
+              />
+              {/* 삭제 */}
+              <button
+                onClick={() => removeSetupRow(row.id)}
+                style={{ width: 28, height: 28, borderRadius: 99, border: "none", background: "#FEF2F2", color: "#EF4444", fontSize: 14, cursor: "pointer", flexShrink: 0 }}
+              >×</button>
+            </div>
+          ))}
+        </div>
+
+        {/* 행 추가 */}
+        <button onClick={addSetupRow} style={{
+          width: "100%", padding: "12px", marginBottom: 24,
+          background: "white", border: "2px dashed #CBD5E1", borderRadius: 12,
+          fontSize: 13, fontWeight: 700, color: "#94A3B8", cursor: "pointer",
+        }}>
+          ➕ 품목 추가
+        </button>
+
+        {/* 안내 */}
+        <div style={{ background: "#EFF6FF", border: "1px solid #BFDBFE", borderRadius: 12, padding: "12px 14px", marginBottom: 20, fontSize: 12, color: "#1D4ED8", lineHeight: 1.6 }}>
+          💡 <strong>수량</strong>은 현재 남은 재고, <strong>주간목표</strong>는 일주일에 필요한 양이에요.<br />
+          나중에 재고현황 탭에서 언제든 수정할 수 있어요.
+        </div>
+
+        {/* 완료 버튼 */}
+        <button onClick={handleSetupComplete} style={{
+          width: "100%", padding: "16px",
+          background: "linear-gradient(135deg,#FF6B35,#C0392B)",
+          color: "white", border: "none", borderRadius: 14,
+          fontSize: 16, fontWeight: 800, cursor: "pointer",
+          boxShadow: "0 4px 20px rgba(192,57,43,0.35)",
+        }}>
+          {setupRows.filter(r => r.name.trim()).length > 0
+            ? `✅ ${setupRows.filter(r => r.name.trim()).length}개 품목으로 시작하기`
+            : "건너뛰고 시작하기 →"}
+        </button>
+      </div>
+    </div>
+  );
+
+  // ════════════════════════════════════════════════════════
+  // 발주서 모달
+  // ════════════════════════════════════════════════════════
+  if (showOrder) return (
+    <div style={{ minHeight: "100vh", background: "#F8FAFC", fontFamily: "-apple-system,'Apple SD Gothic Neo',sans-serif", maxWidth: 430, margin: "0 auto" }}>
+      <div style={{ background: "linear-gradient(135deg,#F59E0B,#D97706)", padding: "18px 20px 22px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <button onClick={() => setShowOrder(false)} style={{ background: "rgba(255,255,255,0.2)", border: "none", borderRadius: 99, width: 32, height: 32, color: "white", fontSize: 16, cursor: "pointer" }}>←</button>
+          <div>
+            <div style={{ color: "rgba(255,255,255,0.8)", fontSize: 11 }}>자동 생성</div>
+            <div style={{ color: "white", fontSize: 20, fontWeight: 800 }}>📋 발주서</div>
+          </div>
+        </div>
+      </div>
+
+      <div style={{ padding: "20px 16px", paddingBottom: 100 }}>
+        <div style={{ background: "#FFFBEB", border: "1px solid #FDE68A", borderRadius: 14, padding: "14px 16px", marginBottom: 20, fontSize: 13, color: "#92400E", lineHeight: 1.6 }}>
+          ⚡ 재고 부족·주의 품목을 자동으로 계산했어요<br />
+          <span style={{ fontSize: 12, color: "#B45309" }}>수량을 조정한 후 발주 확정하면 사장님 기록에 저장돼요</span>
+        </div>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 12, marginBottom: 24 }}>
+          {orderItems.map((item, idx) => {
+            const cat = CAT_STYLE[item.category] || CAT_STYLE["용품"];
+            const s = getStatus(item);
+            const sc = STATUS_STYLE[s];
+            return (
+              <div key={item.id} style={{ ...S.card, border: `2px solid ${cat.border}` }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                  <div>
+                    <CategoryBadge category={item.category} />
+                    <span style={{ fontSize: 14, fontWeight: 700, color: "#1E293B" }}>{item.name}</span>
+                  </div>
+                  <span style={{ background: sc.bg, color: sc.text, fontSize: 11, fontWeight: 700, borderRadius: 99, padding: "3px 8px" }}>{s}</span>
+                </div>
+
+                {/* 현황 바 */}
+                <div style={{ background: "#F1F5F9", borderRadius: 10, padding: "10px 12px", marginBottom: 10 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "#64748B", marginBottom: 6 }}>
+                    <span>현재 재고</span>
+                    <span>주간 목표</span>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ fontSize: 16, fontWeight: 800, color: sc.text }}>{item.stock || 0}{item.unit}</span>
+                    <div style={{ flex: 1, background: "#E2E8F0", borderRadius: 99, height: 6, overflow: "hidden" }}>
+                      <div style={{ width: `${Math.min(100, ((parseFloat(item.stock) || 0) / item.weeklyNeeded) * 100)}%`, height: "100%", background: sc.dot, borderRadius: 99 }} />
+                    </div>
+                    <span style={{ fontSize: 14, fontWeight: 700, color: "#334155" }}>{item.weeklyNeeded}{item.unit}</span>
+                  </div>
+                </div>
+
+                {/* 발주 수량 */}
+                <div>
+                  <div style={{ fontSize: 11, color: "#94A3B8", fontWeight: 600, marginBottom: 6 }}>
+                    발주 수량 <span style={{ color: "#F59E0B" }}>(부족분: {needQty(item)}{item.unit})</span>
+                  </div>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                    <button onClick={() => setOrderItems(prev => prev.map((p, i) => i === idx ? { ...p, orderQty: String(Math.max(0, parseFloat(p.orderQty || 0) - 1)) } : p))}
+                      style={{ width: 36, height: 36, borderRadius: 99, border: "2px solid #E2E8F0", background: "white", fontSize: 18, cursor: "pointer", color: "#64748B" }}>−</button>
+                    <input type="number" value={item.orderQty}
+                      onChange={e => setOrderItems(prev => prev.map((p, i) => i === idx ? { ...p, orderQty: e.target.value } : p))}
+                      style={{ flex: 1, padding: "10px", borderRadius: 10, border: "2px solid #FDE68A", fontSize: 18, fontWeight: 800, color: "#D97706", textAlign: "center", outline: "none" }} />
+                    <button onClick={() => setOrderItems(prev => prev.map((p, i) => i === idx ? { ...p, orderQty: String(parseFloat(p.orderQty || 0) + 1) } : p))}
+                      style={{ width: 36, height: 36, borderRadius: 99, border: "2px solid #E2E8F0", background: "white", fontSize: 18, cursor: "pointer", color: "#64748B" }}>+</button>
+                    <span style={{ fontSize: 14, color: "#64748B", fontWeight: 600, minWidth: 24 }}>{item.unit}</span>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* 합계 */}
+        <div style={{ ...S.card, marginBottom: 20, background: "#FFFBEB", border: "2px solid #FDE68A" }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: "#92400E", marginBottom: 10 }}>📋 발주 요약</div>
+          {orderItems.filter(i => parseFloat(i.orderQty) > 0).map((item, i) => (
+            <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: "#64748B", marginBottom: 5 }}>
+              <span>{CAT_STYLE[item.category]?.emoji} {item.name}</span>
+              <span style={{ fontWeight: 700, color: "#D97706" }}>{item.orderQty}{item.unit}</span>
+            </div>
+          ))}
+          <div style={{ borderTop: "1px solid #FDE68A", marginTop: 10, paddingTop: 10, fontSize: 13, fontWeight: 700, color: "#92400E", display: "flex", justifyContent: "space-between" }}>
+            <span>총 품목 수</span>
+            <span>{orderItems.filter(i => parseFloat(i.orderQty) > 0).length}개</span>
+          </div>
+        </div>
+
+        <button onClick={confirmOrder} style={{ ...S.btnPrimary, width: "100%", padding: "16px", fontSize: 16, background: "linear-gradient(135deg,#F59E0B,#D97706)", boxShadow: "0 4px 16px rgba(217,119,6,0.4)" }}>
+          ✅ 발주 확정
+        </button>
+      </div>
+    </div>
+  );
+
+  const tabs = [
+    { id: "dashboard", label: "대시보드", emoji: "📊" },
+    { id: "inbound",   label: "입고등록",  emoji: "📷" },
+    { id: "stock",     label: "재고현황",  emoji: "✏️" },
+    ...(user.isAdmin ? [{ id: "admin", label: "관리", emoji: "👑" }] : []),
+  ];
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#F8FAFC", fontFamily: "-apple-system,'Apple SD Gothic Neo',sans-serif", maxWidth: 430, margin: "0 auto", paddingBottom: 88 }}>
+
+      {/* 헤더 */}
+      <div style={{ background: user.isAdmin ? "linear-gradient(135deg,#7C3AED,#4C1D95)" : "linear-gradient(135deg,#FF6B35,#C0392B)", padding: "18px 20px 22px", position: "sticky", top: 0, zIndex: 100 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div>
+            <div style={{ color: "rgba(255,255,255,0.75)", fontSize: 11 }}>🍩 던킨도너츠{user.isAdmin && " · 관리자"}</div>
+            <div style={{ color: "white", fontSize: 20, fontWeight: 800, marginTop: 2 }}>
+              {{ dashboard: "대시보드", inbound: "입고 등록", stock: "재고 현황", admin: "관리자" }[page]}
+            </div>
+          </div>
+          <button onClick={() => { setUser(null); setLoginStep("name"); setNameInput(""); setPwInput(""); setSetupDone(false); setSetupRows([{ id: Date.now(), name: "", category: "냉장냉동", unit: "개", stock: "", weeklyNeeded: "" }, { id: Date.now()+1, name: "", category: "냉장냉동", unit: "개", stock: "", weeklyNeeded: "" }, { id: Date.now()+2, name: "", category: "냉장냉동", unit: "개", stock: "", weeklyNeeded: "" }]); }} style={{ background: "rgba(255,255,255,0.2)", border: "none", borderRadius: 20, padding: "6px 12px", color: "white", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
+            {user.isAdmin ? "👑" : "👤"} {user.name}
+          </button>
+        </div>
+      </div>
+
+      {/* ════ 대시보드 ════ */}
+      {page === "dashboard" && (
+        <div style={{ padding: "20px 16px" }}>
+
+          {/* 발주 필요 배너 */}
+          {orderNeeds.length > 0 && (
+            <div style={{ background: "linear-gradient(135deg,#FEF3C7,#FDE68A)", border: "2px solid #F59E0B", borderRadius: 16, padding: "16px", marginBottom: 16 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                <div>
+                  <div style={{ fontWeight: 800, color: "#92400E", fontSize: 15, marginBottom: 4 }}>
+                    🚨 발주가 필요해요!
+                  </div>
+                  <div style={{ fontSize: 12, color: "#B45309", lineHeight: 1.6 }}>
+                    {orderNeeds.map(i => (
+                      <span key={i.id} style={{ display: "inline-block", background: "rgba(255,255,255,0.6)", borderRadius: 6, padding: "1px 6px", margin: "2px 3px 2px 0", fontWeight: 600 }}>
+                        {i.name} ({needQty(i)}{i.unit} 부족)
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <button onClick={openOrderSheet} style={{
+                marginTop: 12, width: "100%", padding: "12px",
+                background: "linear-gradient(135deg,#F59E0B,#D97706)",
+                color: "white", border: "none", borderRadius: 12,
+                fontSize: 14, fontWeight: 800, cursor: "pointer",
+                boxShadow: "0 4px 12px rgba(217,119,6,0.4)",
+              }}>
+                📋 발주서 자동 생성하기
+              </button>
+            </div>
+          )}
+
+          {/* 부족만 있고 주의는 없을 때 빨간 배너 */}
+          {lowItems.length > 0 && orderNeeds.length === 0 && (
+            <div style={{ background: "#FEF2F2", border: "1px solid #FECACA", borderRadius: 14, padding: "14px 16px", marginBottom: 16, display: "flex", gap: 10 }}>
+              <span style={{ fontSize: 20 }}>🚨</span>
+              <div>
+                <div style={{ fontWeight: 700, color: "#DC2626", fontSize: 14 }}>재고 부족!</div>
+                <div style={{ fontSize: 12, color: "#B91C1C", marginTop: 2 }}>{lowItems.map(i => i.name).join(", ")}</div>
+              </div>
+            </div>
+          )}
+
+          {/* 통계 */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginBottom: 20 }}>
+            {[
+              { label: "부족", value: lowItems.length, color: "#EF4444", bg: "#FEF2F2", emoji: "🔴" },
+              { label: "주의", value: warnItems.length, color: "#F59E0B", bg: "#FFFBEB", emoji: "🟡" },
+              { label: "완료", value: `${filledCnt}/${items.length}`, color: "#22C55E", bg: "#F0FDF4", emoji: "✅" },
+            ].map(s => (
+              <div key={s.label} style={{ background: s.bg, borderRadius: 14, padding: "14px 10px", textAlign: "center" }}>
+                <div style={{ fontSize: 20 }}>{s.emoji}</div>
+                <div style={{ fontSize: 20, fontWeight: 800, color: s.color }}>{s.value}</div>
+                <div style={{ fontSize: 11, color: "#64748B", fontWeight: 500 }}>{s.label}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* 최근 입고 */}
+          <div style={{ fontWeight: 700, color: "#334155", fontSize: 14, marginBottom: 10 }}>최근 입고 내역</div>
+          {inboundLogs.length === 0 ? (
+            <div style={{ ...S.card, textAlign: "center", color: "#94A3B8", fontSize: 13, marginBottom: 20 }}>
+              아직 입고 기록이 없어요<br /><span style={{ fontSize: 11 }}>📷 영수증을 스캔하면 여기에 나타나요</span>
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 20 }}>
+              {inboundLogs.slice(0, 3).map(log => (
+                <div key={log.id} style={{ ...S.card, display: "flex", gap: 12, alignItems: "flex-start" }}>
+                  {log.preview && <img src={log.preview} alt="" style={{ width: 44, height: 44, objectFit: "cover", borderRadius: 8, flexShrink: 0 }} />}
+                  <div style={{ flex: 1 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between" }}>
+                      <span style={{ fontWeight: 700, fontSize: 13 }}>👤 {log.user}</span>
+                      <span style={{ fontSize: 11, color: "#94A3B8" }}>{log.date} {log.time}</span>
+                    </div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 6 }}>
+                      {log.items.map((it, i) => (
+                        <span key={i} style={{ background: CAT_STYLE[it.category]?.bg || "#F1F5F9", color: CAT_STYLE[it.category]?.text || "#64748B", fontSize: 11, fontWeight: 600, borderRadius: 8, padding: "3px 7px" }}>
+                          {CAT_STYLE[it.category]?.emoji} {it.name} {it.qty}{it.unit}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* 재고 현황 */}
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+            <div style={{ fontWeight: 700, color: "#334155", fontSize: 14 }}>전체 재고 현황</div>
+            <div style={{ display: "flex", gap: 5 }}>
+              {["전체", ...CATEGORIES].map(c => (
+                <button key={c} onClick={() => setDashCat(c)} style={{ padding: "5px 10px", borderRadius: 99, border: "none", background: dashCat === c ? "#FF6B35" : "#F1F5F9", color: dashCat === c ? "white" : "#64748B", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+                  {c === "전체" ? "전체" : CAT_STYLE[c].emoji}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {items.length === 0 ? (
+            <div style={{ ...S.card, textAlign: "center", color: "#94A3B8", fontSize: 13 }}>
+              📦 등록된 품목이 없어요<br /><span style={{ fontSize: 11 }}>입고 등록 또는 재고현황에서 품목을 추가해요</span>
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {visible(dashCat).map(item => {
+                const s = getStatus(item);
+                const sc = STATUS_STYLE[s];
+                const val = parseFloat(item.stock) || 0;
+                const pct = item.weeklyNeeded ? Math.min(100, (val / item.weeklyNeeded) * 100) : 0;
+                return (
+                  <div key={item.id} style={{ ...S.card, borderLeft: `4px solid ${sc.dot}` }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                      <div><CategoryBadge category={item.category} /><span style={{ fontSize: 14, fontWeight: 700, color: "#1E293B" }}>{item.name}</span></div>
+                      <span style={{ background: sc.bg, color: sc.text, fontSize: 11, fontWeight: 700, borderRadius: 99, padding: "3px 8px" }}>{s}</span>
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <div style={{ flex: 1, background: "#F1F5F9", borderRadius: 99, height: 6, overflow: "hidden" }}>
+                        <div style={{ width: `${pct}%`, height: "100%", background: sc.dot, borderRadius: 99, transition: "width 0.3s" }} />
+                      </div>
+                      <span style={{ fontSize: 11, color: "#64748B", whiteSpace: "nowrap" }}>
+                        {item.stock !== "" && item.stock !== null ? `${item.stock} / ${item.weeklyNeeded ?? "?"}${item.unit}` : "목표 미설정"}
+                      </span>
+                    </div>
+                    {(s === "부족" || s === "주의") && item.weeklyNeeded && (
+                      <div style={{ marginTop: 6, fontSize: 11, color: "#F59E0B", fontWeight: 600 }}>
+                        ⚡ {needQty(item)}{item.unit} 부족 — 발주 필요
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ════ 입고 등록 ════ */}
+      {page === "inbound" && (
+        <div style={{ padding: "20px 16px" }}>
+          {scanStep === "idle" && (
+            <>
+              {/* 카메라 직접 촬영 input (capture=environment → 후면 카메라) */}
+              <input
+                ref={fileRef}
+                type="file"
+                accept="image/*"
+                capture="environment"
+                onChange={handleFile}
+                style={{ display: "none" }}
+              />
+              {/* 갤러리 선택용 별도 input (capture 없음) */}
+              <input
+                id="galleryInput"
+                type="file"
+                accept="image/*"
+                onChange={handleFile}
+                style={{ display: "none" }}
+              />
+
+              {/* 카메라 촬영 메인 버튼 */}
+              <button
+                onClick={() => fileRef.current?.click()}
+                style={{
+                  width: "100%", padding: "0", marginBottom: 12,
+                  background: "linear-gradient(135deg,#FF6B35,#C0392B)",
+                  border: "none", borderRadius: 20, cursor: "pointer",
+                  boxShadow: "0 6px 24px rgba(192,57,43,0.4)", overflow: "hidden",
+                }}
+              >
+                <div style={{ padding: "28px 20px", display: "flex", flexDirection: "column", alignItems: "center", gap: 8 }}>
+                  <div style={{ fontSize: 48 }}>📷</div>
+                  <div style={{ color: "white", fontSize: 18, fontWeight: 800 }}>카메라로 영수증 찍기</div>
+                  <div style={{ color: "rgba(255,255,255,0.8)", fontSize: 12 }}>버튼을 누르면 카메라가 바로 열려요</div>
+                </div>
+              </button>
+
+              {/* 갤러리에서 선택 버튼 */}
+              <button
+                onClick={() => document.getElementById("galleryInput")?.click()}
+                style={{
+                  width: "100%", padding: "14px",
+                  background: "white", border: "2px solid #E2E8F0",
+                  borderRadius: 14, cursor: "pointer",
+                  fontSize: 14, fontWeight: 700, color: "#64748B",
+                  display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+                  marginBottom: 16,
+                }}
+              >
+                🖼️ 갤러리에서 사진 선택
+              </button>
+
+              <div style={{ background: "#EFF6FF", border: "1px solid #BFDBFE", borderRadius: 12, padding: "12px 14px", marginBottom: 16, fontSize: 12, color: "#1D4ED8", lineHeight: 1.6 }}>
+                💡 영수증이 흐려도 괜찮아요 — AI가 읽은 후 직접 수정할 수 있어요
+              </div>
+
+              {scanError && <div style={{ background: "#FEF2F2", border: "1px solid #FECACA", borderRadius: 12, padding: "12px 14px", color: "#DC2626", fontSize: 13, marginBottom: 14 }}>⚠️ {scanError}</div>}
+              {inboundLogs.length > 0 && (
+                <>
+                  <div style={{ fontWeight: 700, color: "#334155", fontSize: 14, margin: "24px 0 10px" }}>최근 입고 기록</div>
+                  {inboundLogs.slice(0, 4).map(log => (
+                    <div key={log.id} style={{ ...S.card, marginBottom: 8 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+                        <span style={{ fontWeight: 700, fontSize: 13 }}>👤 {log.user}</span>
+                        <span style={{ fontSize: 11, color: "#94A3B8" }}>{log.date} {log.time}</span>
+                      </div>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                        {log.items.map((it, i) => (
+                          <span key={i} style={{ background: CAT_STYLE[it.category]?.bg || "#F1F5F9", color: CAT_STYLE[it.category]?.text || "#64748B", fontSize: 11, fontWeight: 600, borderRadius: 8, padding: "3px 7px" }}>
+                            {CAT_STYLE[it.category]?.emoji} {it.name} {it.qty}{it.unit}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </>
+              )}
+            </>
+          )}
+
+          {scanStep === "loading" && (
+            <div style={{ textAlign: "center", padding: "40px 20px" }}>
+              {preview && <img src={preview} alt="" style={{ maxWidth: "100%", maxHeight: 200, borderRadius: 12, marginBottom: 24, objectFit: "contain" }} />}
+              <div style={{ fontSize: 36, marginBottom: 12 }}>🔍</div>
+              <div style={{ fontSize: 16, fontWeight: 700, color: "#1E293B", marginBottom: 6 }}>AI가 영수증을 읽는 중...</div>
+              <div style={{ fontSize: 13, color: "#64748B" }}>품목과 수량을 자동으로 인식하고 있어요</div>
+            </div>
+          )}
+
+          {scanStep === "review" && (() => {
+            const kept = parsed.filter(p => p.keep).length;
+            return (
+            <>
+              {/* 영수증 미리보기 + 요약 */}
+              <div style={{ display: "flex", gap: 12, marginBottom: 16, alignItems: "flex-start" }}>
+                {preview && (
+                  <img src={preview} alt="" style={{ width: 80, height: 80, objectFit: "cover", borderRadius: 12, border: "2px solid #E2E8F0", flexShrink: 0 }} />
+                )}
+                <div style={{ flex: 1 }}>
+                  <div style={{ background: "#F0FDF4", border: "1px solid #BBF7D0", borderRadius: 12, padding: "10px 14px", marginBottom: 8, fontSize: 13, color: "#15803D", fontWeight: 700 }}>
+                    ✅ {parsed.length}개 품목 자동 분류 완료
+                  </div>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    {CATEGORIES.map(c => {
+                      const cnt = parsed.filter(p => p.category === c).length;
+                      return cnt > 0 ? (
+                        <div key={c} style={{ background: CAT_STYLE[c].bg, borderRadius: 8, padding: "5px 10px", fontSize: 11, fontWeight: 700, color: CAT_STYLE[c].text }}>
+                          {CAT_STYLE[c].emoji} {c} {cnt}개
+                        </div>
+                      ) : null;
+                    })}
+                  </div>
+                </div>
+              </div>
+
+              <div style={{ fontSize: 12, color: "#94A3B8", marginBottom: 12, fontWeight: 500 }}>
+                품목명·수량을 수정하거나 카테고리를 변경할 수 있어요
+              </div>
+
+              {/* 카테고리별 그룹 */}
+              {CATEGORIES.map(cat => {
+                const group = parsed.filter(p => p.category === cat);
+                if (group.length === 0) return null;
+                const cs = CAT_STYLE[cat];
+                return (
+                  <div key={cat} style={{ marginBottom: 20 }}>
+                    {/* 카테고리 헤더 */}
+                    <div style={{
+                      background: cs.bg, border: `2px solid ${cs.border}`,
+                      borderRadius: 12, padding: "10px 14px", marginBottom: 10,
+                      display: "flex", alignItems: "center", justifyContent: "space-between"
+                    }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <span style={{ fontSize: 20 }}>{cs.emoji}</span>
+                        <span style={{ fontSize: 15, fontWeight: 800, color: cs.text }}>{cat}</span>
+                      </div>
+                      <span style={{ fontSize: 12, fontWeight: 700, color: cs.text, background: "rgba(255,255,255,0.6)", borderRadius: 99, padding: "3px 10px" }}>
+                        {group.filter(p => p.keep).length}개 선택됨
+                      </span>
+                    </div>
+
+                    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                      {group.map(p => (
+                        <div key={p.tempId} style={{
+                          ...S.card,
+                          opacity: p.keep ? 1 : 0.45,
+                          border: `2px solid ${p.keep ? cs.border : "#E2E8F0"}`,
+                          marginLeft: 8,
+                        }}>
+                          {/* 품목명 + 토글 */}
+                          <div style={{ display: "flex", alignItems: "center", marginBottom: 10 }}>
+                            <input
+                              value={p.name}
+                              onChange={e => updateParsed(p.tempId, "name", e.target.value)}
+                              placeholder="품목명"
+                              style={{ flex: 1, border: "none", borderBottom: "2px solid #E2E8F0", outline: "none", fontSize: 15, fontWeight: 700, color: "#1E293B", background: "transparent", paddingBottom: 4, marginRight: 10 }}
+                            />
+                            <button onClick={() => updateParsed(p.tempId, "keep", !p.keep)} style={{ width: 30, height: 30, borderRadius: 99, border: "none", background: p.keep ? "#22C55E" : "#E2E8F0", color: "white", fontSize: 15, cursor: "pointer", flexShrink: 0 }}>
+                              {p.keep ? "✓" : "×"}
+                            </button>
+                          </div>
+
+                          {/* 수량·단위·주간목표 */}
+                          <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+                            {[["qty","수량","number"],["unit","단위","text"],["weeklyNeeded","주간목표","number"]].map(([field, label, type]) => (
+                              <div key={field} style={{ flex: 1 }}>
+                                <div style={{ fontSize: 10, color: "#94A3B8", fontWeight: 600, marginBottom: 4 }}>{label}</div>
+                                <input
+                                  type={type} value={p[field]}
+                                  onChange={e => updateParsed(p.tempId, field, e.target.value)}
+                                  placeholder={field === "weeklyNeeded" ? "선택" : ""}
+                                  style={{ width: "100%", padding: "8px", borderRadius: 8, border: "2px solid #E2E8F0", fontSize: 14, fontWeight: field === "qty" ? 700 : 400, color: field === "qty" ? cs.text : "#64748B", textAlign: "center", outline: "none", boxSizing: "border-box" }}
+                                />
+                              </div>
+                            ))}
+                          </div>
+
+                          {/* 카테고리 변경 버튼 */}
+                          <div style={{ display: "flex", gap: 6 }}>
+                            {CATEGORIES.map(c => (
+                              <button key={c} onClick={() => updateParsed(p.tempId, "category", c)} style={{
+                                flex: 1, padding: "6px 0", borderRadius: 8,
+                                background: p.category === c ? CAT_STYLE[c].bg : "#F8FAFC",
+                                color: p.category === c ? CAT_STYLE[c].text : "#94A3B8",
+                                border: `2px solid ${p.category === c ? CAT_STYLE[c].border : "transparent"}`,
+                                fontSize: 11, fontWeight: 700, cursor: "pointer",
+                              }}>
+                                {CAT_STYLE[c].emoji} {c}
+                              </button>
+                            ))}
+                          </div>
+
+                          {p.isNew && (
+                            <div style={{ marginTop: 8, fontSize: 11, color: "#7C3AED", fontWeight: 600 }}>✨ 새로 추가되는 품목</div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
+
+              <div style={{ display: "flex", gap: 10, marginTop: 4 }}>
+                <button onClick={resetScan} style={{ ...S.btnSecondary, flex: 1 }}>다시 찍기</button>
+                <button onClick={confirmInbound} style={{ ...S.btnPrimary, flex: 2 }}>💾 {kept}개 입고 저장</button>
+              </div>
+            </>
+            );
+          })()}
+
+          {scanStep === "done" && (
+            <div style={{ textAlign: "center", padding: "48px 20px" }}>
+              <div style={{ fontSize: 56, marginBottom: 14 }}>🎉</div>
+              <div style={{ fontSize: 18, fontWeight: 800, color: "#1E293B", marginBottom: 8 }}>입고 등록 완료!</div>
+              <div style={{ fontSize: 13, color: "#64748B", marginBottom: 32 }}>재고 현황에 반영됐어요</div>
+              <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+                <button onClick={resetScan} style={{ ...S.btnPrimary, padding: "13px 24px" }}>📷 다음 영수증</button>
+                <button onClick={() => setPage("dashboard")} style={{ ...S.btnSecondary, padding: "13px 24px" }}>📊 대시보드</button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ════ 재고 현황 ════ */}
+      {page === "stock" && (
+        <div style={{ padding: "20px 16px" }}>
+          <button onClick={() => setShowAddItem(true)} style={{ width: "100%", padding: "13px", marginBottom: 16, background: "white", border: "2px dashed #CBD5E1", borderRadius: 14, fontSize: 14, fontWeight: 700, color: "#64748B", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+            ➕ 품목 직접 추가
+          </button>
+
+          {showAddItem && (
+            <div style={{ ...S.card, marginBottom: 16, border: "2px solid #DDD6FE" }}>
+              <div style={{ fontWeight: 700, color: "#7C3AED", fontSize: 14, marginBottom: 12 }}>✏️ 새 품목 추가</div>
+              <div style={{ marginBottom: 8 }}>
+                <div style={{ fontSize: 11, color: "#94A3B8", fontWeight: 600, marginBottom: 4 }}>품목명 *</div>
+                <input value={newItem.name} onChange={e => setNewItem(p => ({ ...p, name: e.target.value }))} placeholder="예) 도넛믹스, 일회용컵..." style={{ ...S.input }} />
+              </div>
+              <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 11, color: "#94A3B8", fontWeight: 600, marginBottom: 4 }}>단위</div>
+                  <input value={newItem.unit} onChange={e => setNewItem(p => ({ ...p, unit: e.target.value }))} placeholder="개/kg/L..." style={{ ...S.input }} />
+                </div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 11, color: "#94A3B8", fontWeight: 600, marginBottom: 4 }}>주간목표 *</div>
+                  <input type="number" value={newItem.weeklyNeeded} onChange={e => setNewItem(p => ({ ...p, weeklyNeeded: e.target.value }))} placeholder="필수!" style={{ ...S.input }} />
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+                {CATEGORIES.map(c => (
+                  <button key={c} onClick={() => setNewItem(p => ({ ...p, category: c }))} style={{ flex: 1, padding: "9px", borderRadius: 10, background: newItem.category === c ? CAT_STYLE[c].bg : "#F8FAFC", color: newItem.category === c ? CAT_STYLE[c].text : "#94A3B8", border: `2px solid ${newItem.category === c ? CAT_STYLE[c].border : "transparent"}`, fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
+                    {CAT_STYLE[c].emoji} {c}
+                  </button>
+                ))}
+              </div>
+              {addItemError && <div style={{ color: "#EF4444", fontSize: 12, marginBottom: 8 }}>⚠️ {addItemError}</div>}
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={() => { setShowAddItem(false); setAddItemError(""); }} style={{ ...S.btnSecondary, flex: 1 }}>취소</button>
+                <button onClick={handleAddItem} style={{ ...S.btnPrimary, flex: 2 }}>추가</button>
+              </div>
+            </div>
+          )}
+
+          <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+            {["전체", ...CATEGORIES].map(c => (
+              <button key={c} onClick={() => setStockCat(c)} style={{ padding: "7px 14px", borderRadius: 99, border: "none", background: stockCat === c ? "#FF6B35" : "#F1F5F9", color: stockCat === c ? "white" : "#64748B", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
+                {c === "전체" ? "전체" : `${CAT_STYLE[c].emoji} ${c}`}
+              </button>
+            ))}
+          </div>
+
+          {items.length === 0 ? (
+            <div style={{ ...S.card, textAlign: "center", color: "#94A3B8", fontSize: 13 }}>
+              📦 아직 등록된 품목이 없어요<br /><span style={{ fontSize: 11 }}>위에서 품목을 추가하거나 영수증을 스캔해요</span>
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {visible(stockCat).map(item => {
+                const s = getStatus(item);
+                const sc = STATUS_STYLE[s];
+                return (
+                  <div key={item.id} style={{ ...S.card }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                      <div>
+                        <CategoryBadge category={item.category} />
+                        <span style={{ fontSize: 14, fontWeight: 700, color: "#1E293B" }}>{item.name}</span>
+                        {item.weeklyNeeded && <span style={{ fontSize: 11, color: "#94A3B8", marginLeft: 5 }}>목표 {item.weeklyNeeded}{item.unit}</span>}
+                      </div>
+                      {item.stock !== "" && item.stock !== null && (
+                        <span style={{ background: sc.bg, color: sc.text, fontSize: 11, fontWeight: 700, borderRadius: 99, padding: "3px 8px" }}>{s}</span>
+                      )}
+                    </div>
+                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                      <input type="number" placeholder="현재 수량" value={item.stock ?? ""}
+                        onChange={e => setItems(prev => prev.map(it => it.id === item.id ? { ...it, stock: e.target.value } : it))}
+                        style={{ flex: 1, padding: "10px 14px", borderRadius: 10, border: `2px solid ${item.stock ? sc.dot : "#E2E8F0"}`, fontSize: 16, fontWeight: 700, color: "#1E293B", outline: "none", background: item.stock ? sc.bg : "white" }} />
+                      <span style={{ fontSize: 14, color: "#64748B", fontWeight: 600 }}>{item.unit}</span>
+                    </div>
+                    {(s === "부족" || s === "주의") && item.weeklyNeeded && (
+                      <div style={{ marginTop: 6, fontSize: 11, color: "#F59E0B", fontWeight: 600 }}>⚡ {needQty(item)}{item.unit} 부족</div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ════ 관리자 ════ */}
+      {page === "admin" && user.isAdmin && (
+        <div style={{ padding: "20px 16px" }}>
+          <div style={{ background: "linear-gradient(135deg,#F5F3FF,#EDE9FE)", border: "1px solid #DDD6FE", borderRadius: 14, padding: "14px 16px", marginBottom: 20, fontSize: 13, color: "#7C3AED", fontWeight: 600 }}>
+            👑 사장님 전용 관리 화면이에요
+          </div>
+          <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+            {[{ id: "items", label: "📦 품목 관리" }, { id: "orders", label: "📋 발주 기록" }, { id: "logs", label: "🚚 입고 기록" }].map(t => (
+              <button key={t.id} onClick={() => setAdminTab(t.id)} style={{ flex: 1, padding: "10px 6px", borderRadius: 10, border: "none", background: adminTab === t.id ? "#7C3AED" : "#F5F3FF", color: adminTab === t.id ? "white" : "#7C3AED", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+                {t.label}
+              </button>
+            ))}
+          </div>
+
+          {/* 품목 관리 */}
+          {adminTab === "items" && (
+            <>
+              <button onClick={() => setShowAddItem(v => !v)} style={{ width: "100%", padding: "13px", marginBottom: 14, background: showAddItem ? "#F5F3FF" : "white", border: "2px dashed #DDD6FE", borderRadius: 14, fontSize: 14, fontWeight: 700, color: "#7C3AED", cursor: "pointer" }}>
+                {showAddItem ? "✕ 닫기" : "➕ 품목 직접 추가"}
+              </button>
+              {showAddItem && (
+                <div style={{ ...S.card, marginBottom: 14, border: "2px solid #DDD6FE" }}>
+                  <div style={{ fontWeight: 700, color: "#7C3AED", fontSize: 14, marginBottom: 12 }}>새 품목 추가</div>
+                  <div style={{ marginBottom: 8 }}>
+                    <div style={{ fontSize: 11, color: "#94A3B8", fontWeight: 600, marginBottom: 4 }}>품목명 *</div>
+                    <input value={newItem.name} onChange={e => setNewItem(p => ({ ...p, name: e.target.value }))} placeholder="예) 도넛믹스..." style={{ ...S.input }} />
+                  </div>
+                  <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 11, color: "#94A3B8", fontWeight: 600, marginBottom: 4 }}>단위</div>
+                      <input value={newItem.unit} onChange={e => setNewItem(p => ({ ...p, unit: e.target.value }))} placeholder="개/kg/L" style={{ ...S.input }} />
+                    </div>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 11, color: "#94A3B8", fontWeight: 600, marginBottom: 4 }}>주간목표</div>
+                      <input type="number" value={newItem.weeklyNeeded} onChange={e => setNewItem(p => ({ ...p, weeklyNeeded: e.target.value }))} placeholder="수량" style={{ ...S.input }} />
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+                    {CATEGORIES.map(c => (
+                      <button key={c} onClick={() => setNewItem(p => ({ ...p, category: c }))} style={{ flex: 1, padding: "8px", borderRadius: 8, background: newItem.category === c ? CAT_STYLE[c].bg : "#F8FAFC", color: newItem.category === c ? CAT_STYLE[c].text : "#94A3B8", border: `2px solid ${newItem.category === c ? CAT_STYLE[c].border : "transparent"}`, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
+                        {CAT_STYLE[c].emoji} {c}
+                      </button>
+                    ))}
+                  </div>
+                  {addItemError && <div style={{ color: "#EF4444", fontSize: 12, marginBottom: 8 }}>⚠️ {addItemError}</div>}
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button onClick={() => { setShowAddItem(false); setAddItemError(""); }} style={{ ...S.btnSecondary, flex: 1 }}>취소</button>
+                    <button onClick={handleAddItem} style={{ ...S.btnPrimary, flex: 2 }}>추가하기</button>
+                  </div>
+                </div>
+              )}
+              {items.length === 0 ? (
+                <div style={{ ...S.card, textAlign: "center", color: "#94A3B8", fontSize: 13 }}>📦 등록된 품목이 없어요</div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {items.map(item => (
+                    <div key={item.id} style={{ ...S.card }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                        <div style={{ flex: 1 }}>
+                          <div style={{ display: "flex", alignItems: "center", marginBottom: 4 }}>
+                            <CategoryBadge category={item.category} />
+                            <span style={{ fontSize: 14, fontWeight: 700, color: "#1E293B" }}>{item.name}</span>
+                          </div>
+                          <div style={{ fontSize: 11, color: "#94A3B8" }}>
+                            단위: {item.unit}{item.weeklyNeeded ? ` · 주간목표: ${item.weeklyNeeded}${item.unit}` : ""}{item.addedAt ? ` · ${item.addedAt} (${item.addedBy})` : ""}
+                          </div>
+                        </div>
+                        <button onClick={() => setItems(prev => prev.filter(i => i.id !== item.id))} style={{ background: "#FEF2F2", border: "none", borderRadius: 8, padding: "6px 10px", color: "#EF4444", fontSize: 12, fontWeight: 700, cursor: "pointer", marginLeft: 8 }}>삭제</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+
+          {/* 발주 기록 */}
+          {adminTab === "orders" && (
+            <>
+              {orderSheets.length === 0 ? (
+                <div style={{ ...S.card, textAlign: "center", color: "#94A3B8", fontSize: 13 }}>📋 아직 발주 기록이 없어요</div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  {orderSheets.map(sheet => (
+                    <div key={sheet.id} style={{ ...S.card, border: "2px solid #FDE68A" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
+                        <div>
+                          <span style={{ fontWeight: 700, fontSize: 13 }}>📋 발주서</span>
+                          <span style={{ fontSize: 11, color: "#94A3B8", marginLeft: 8 }}>{sheet.date} {sheet.time}</span>
+                        </div>
+                        <span style={{ background: "#FFFBEB", color: "#D97706", fontSize: 11, fontWeight: 700, borderRadius: 99, padding: "3px 8px" }}>
+                          {sheet.status}
+                        </span>
+                      </div>
+                      <div style={{ fontSize: 12, color: "#64748B", marginBottom: 8 }}>👤 {sheet.user} 요청</div>
+                      <div style={{ background: "#FFFBEB", borderRadius: 10, padding: "10px 12px" }}>
+                        {sheet.items.map((it, i) => (
+                          <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: i < sheet.items.length - 1 ? 6 : 0 }}>
+                            <span>{CAT_STYLE[it.category]?.emoji} {it.name}</span>
+                            <span style={{ fontWeight: 700, color: "#D97706" }}>{it.qty}{it.unit}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+
+          {/* 입고 기록 */}
+          {adminTab === "logs" && (
+            <>
+              {inboundLogs.length === 0 ? (
+                <div style={{ ...S.card, textAlign: "center", color: "#94A3B8", fontSize: 13 }}>🚚 아직 입고 기록이 없어요</div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {inboundLogs.map(log => (
+                    <div key={log.id} style={{ ...S.card }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                          {log.preview && <img src={log.preview} alt="" style={{ width: 36, height: 36, objectFit: "cover", borderRadius: 6 }} />}
+                          <div>
+                            <div style={{ fontWeight: 700, fontSize: 13 }}>👤 {log.user}</div>
+                            <div style={{ fontSize: 11, color: "#94A3B8" }}>{log.date} {log.time}</div>
+                          </div>
+                        </div>
+                        <div style={{ fontSize: 12, color: "#7C3AED", fontWeight: 700 }}>{log.items.length}개</div>
+                      </div>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                        {log.items.map((it, i) => (
+                          <span key={i} style={{ background: CAT_STYLE[it.category]?.bg || "#F1F5F9", color: CAT_STYLE[it.category]?.text || "#64748B", fontSize: 11, fontWeight: 600, borderRadius: 8, padding: "3px 7px" }}>
+                            {CAT_STYLE[it.category]?.emoji} {it.name} {it.qty}{it.unit}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {/* 하단 네비 */}
+      <div style={{ position: "fixed", bottom: 0, left: "50%", transform: "translateX(-50%)", width: "100%", maxWidth: 430, background: "white", borderTop: "1px solid #F1F5F9", display: "flex", padding: "10px 0 20px", zIndex: 200 }}>
+        {tabs.map(tab => (
+          <button key={tab.id} onClick={() => { setPage(tab.id); if (tab.id === "inbound" && scanStep === "done") resetScan(); setShowAddItem(false); }} style={{ flex: 1, border: "none", background: "none", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 3, padding: "8px 0", position: "relative" }}>
+            <span style={{ fontSize: 21 }}>{tab.emoji}</span>
+            <span style={{ fontSize: 10, fontWeight: 700, color: page === tab.id ? (user.isAdmin && tab.id === "admin" ? "#7C3AED" : "#FF6B35") : "#94A3B8" }}>{tab.label}</span>
+            {page === tab.id && <div style={{ width: 4, height: 4, borderRadius: 99, background: user.isAdmin && tab.id === "admin" ? "#7C3AED" : "#FF6B35" }} />}
+            {/* 발주 뱃지 */}
+            {tab.id === "dashboard" && orderNeeds.length > 0 && (
+              <div style={{ position: "absolute", top: 4, right: "50%", transform: "translateX(8px)", background: "#EF4444", color: "white", borderRadius: 99, width: 16, height: 16, fontSize: 9, fontWeight: 800, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                {orderNeeds.length}
+              </div>
+            )}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
